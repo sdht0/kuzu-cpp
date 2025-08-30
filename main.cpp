@@ -1,17 +1,35 @@
 #include <cassert>
 #include <iostream>
+#include <ranges>
 
 #include "kuzu.hpp"
 
 using namespace kuzu::main;
 using namespace std;
 
-unique_ptr<QueryResult> runQuery(const string_view& query, unique_ptr<Connection>& connection) {
-    auto result = connection->query(query);
-    if (!result->isSuccess()) {
-        throw std::runtime_error(result->getErrorMessage());
+unique_ptr<QueryResult> runQuery(const string_view &query, unique_ptr<Connection> &connection) {
+    auto results = connection->query(query);
+    if (!results->isSuccess()) {
+        throw std::runtime_error(results->getErrorMessage());
     }
-    return result;
+    return results;
+}
+
+unique_ptr<QueryResult>
+runPreparedQuery(const string_view &query,
+                 std::unordered_map<std::string, std::unique_ptr<kuzu::common::Value>> inputParams,
+                 const unique_ptr<Connection> &connection) {
+    auto prepared_stmt = connection->prepare(query);
+    if (!prepared_stmt->isSuccess()) {
+        throw std::runtime_error(prepared_stmt->getErrorMessage());
+    }
+
+    auto results = connection->executeWithParams(prepared_stmt.get(), std::move(inputParams));
+    if (!results->isSuccess()) {
+        throw std::runtime_error(results->getErrorMessage());
+    }
+
+    return results;
 }
 
 int main() {
@@ -19,35 +37,46 @@ int main() {
     remove("example.kuzu");
     remove("example.kuzu.wal");
 
-    // Create an empty on-disk database and connect to it
     SystemConfig systemConfig;
     auto database = make_unique<Database>("example.kuzu", systemConfig);
-
-    // Connect to the database.
     auto connection = make_unique<Connection>(database.get());
 
-    // Create the schema.
-    runQuery("CREATE NODE TABLE User(name STRING PRIMARY KEY, age INT64)", connection);
-    runQuery("CREATE NODE TABLE City(name STRING PRIMARY KEY, population INT64)", connection);
-    runQuery("CREATE REL TABLE Follows(FROM User TO User, since INT64)", connection);
-    runQuery("CREATE REL TABLE LivesIn(FROM User TO City)", connection);
+    runQuery("CREATE NODE TABLE N(id SERIAL PRIMARY KEY, name STRING, embedding FLOAT[])", connection);
 
-    // Load data.
-    runQuery("COPY User FROM \"data/user.csv\"", connection);
-    runQuery("COPY City FROM \"data/city.csv\"", connection);
-    runQuery("COPY Follows FROM \"data/follows.csv\"", connection);
-    runQuery("COPY LivesIn FROM \"data/lives-in.csv\"", connection);
+    std::unordered_map<std::string, unique_ptr<kuzu::common::Value>> args;
 
-    // Execute a simple query.
-    auto result =
-        runQuery("MATCH (a:User)-[f:Follows]->(b:User) RETURN a.name, f.since, b.name;", connection);
+    args.emplace("name", make_unique<kuzu::common::Value>("hello world"));
 
-    // Output query result.
+    auto type = kuzu::common::LogicalType::LIST(kuzu::common::LogicalType::FLOAT());
+    vector<unique_ptr<kuzu::common::Value>> data;
+    data.emplace_back(make_unique<kuzu::common::Value>(1.0));
+    data.emplace_back(make_unique<kuzu::common::Value>(2.0));
+    data.emplace_back(make_unique<kuzu::common::Value>(3.0));
+    args.emplace("embedding", make_unique<kuzu::common::Value>(std::move(type), std::move(data)));
+
+    runPreparedQuery("CREATE (:N {name: $name, embedding: $embedding});", std::move(args), connection);
+
+    auto result = runQuery("MATCH (n) RETURN n.name, n.embedding;", connection);
+
+    auto columns = result->getColumnNames();
+    for (auto i = 0u; i < columns.size(); ++i) {
+        if (i != 0) {
+            cout << " | ";
+        }
+        cout << columns[i];
+    }
+    cout << "\n";
     while (result->hasNext()) {
         auto row = result->getNext();
-        std::cout << row->getValue(0)->getValue<string>() << " "
-                  << row->getValue(1)->getValue<int64_t>() << " "
-                  << row->getValue(2)->getValue<string>() << std::endl;
+
+        auto value_name = row->getValue(0);
+        KU_ASSERT(value_name->getDataType().getLogicalTypeID() == kuzu::common::LogicalTypeID::STRING);
+        string name = value_name->getValue<string>();
+        cout << name << " | ";
+
+        auto value_embedding = row->getValue(1);
+        KU_ASSERT(value_name->getDataType().getLogicalTypeID() == kuzu::common::LogicalTypeID::LIST);
+        cout << value_embedding->toString();
     }
     return 0;
 }
